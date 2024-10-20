@@ -20,12 +20,30 @@ def parse_file(file = "../data/databento/es/ftp.databento.com/E8XGYL35/GLBX-2024
 
     instrument_map = db.common.symbology.InstrumentMap()
     instrument_map.insert_metadata(data.metadata)
+    instrument_codes = dict()
 
+    start = data.metadata.start
+
+    cutoff = 1726916400
     for mbo in data:
         market.apply(mbo)
 
-        instrument = instrument_map.resolve(mbo.instrument_id, datetime.datetime.fromtimestamp(mbo.ts_recv*1e-9).date())
-        yield (mbo, market, instrument)
+        if mbo.instrument_id in instrument_codes:
+            instrument = instrument_codes[mbo.instrument_id]
+        else:
+            ticker = instrument_map.resolve(mbo.instrument_id, datetime.datetime.fromtimestamp(mbo.ts_event*1e-9).date())
+            if ticker:
+                instrument_codes[mbo.instrument_id] = ticker
+                instrument = ticker
+            else:
+                instrument = None
+
+        is_sept_expiry = instrument in ('MESU4','ESU4')
+        is_dec_expiry = instrument in ('MESZ4','ESZ4')
+
+        if (mbo.ts_event * 1e-9 < cutoff and is_sept_expiry) or (mbo.ts_event * 1e-9 > cutoff and is_dec_expiry):
+            if data.metadata.start <= mbo.ts_event <= data.metadata.end:
+                yield (mbo,market,instrument[:-2],(mbo.ts_event-start)*1e-9)
         """
         print([str(o) for l in market.get_books_by_pub(mbo.instrument_id)[1].bids.values() for o in l.orders])
         # If it's the last update in an event, print the state of the aggregated book
@@ -46,37 +64,45 @@ def interleave(generators):
         try:
             result = next(g)
             if result:
-                mbo, market, instrument = result
-                heapq.heappush(mbos_queue, (mbo.ts_recv, mbo.ts_event, mbo, market, instrument, g))
+                mbo, market, instrument, seconds = result
+                heapq.heappush(mbos_queue, (mbo.ts_recv, mbo.ts_event, str(mbo), mbo, market, instrument, seconds, g))
         except StopIteration:
             continue
     while mbos_queue:
-        ts, ts_event, mbo, market, instrument, g = heapq.heappop(mbos_queue)
-        yield mbo, market, instrument
+        ts, ts_event, _, mbo, market, instrument, seconds, g = heapq.heappop(mbos_queue)
+        yield mbo, market, instrument, seconds
         try:
             result = next(g)
             if result:
-                mbo, market, instrument = result
-                heapq.heappush(mbos_queue, (mbo.ts_recv, mbo.ts_event, mbo, market, instrument, g))
+                mbo, market, instrument, seconds = result
+                heapq.heappush(mbos_queue, (mbo.ts_recv, mbo.ts_event, str(mbo), mbo, market, instrument, seconds, g))
         except StopIteration:
             continue
 
 def write_csv(generator, output_file):
-    with open(output_file,'w') as f:
-        f.write('instrument,timestamp,action,side,size,price,ts_delta,bq,bp,aq,ap,is_last\n')
-        for result in generator:
-            mbo, market, instrument = result
-            try:
-                bid,ask = market.aggregated_bbo(mbo.instrument_id)
-                data = [instrument, mbo.ts_recv * 1e-9, mbo.action, mbo.side, mbo.size, mbo.price, mbo.ts_in_delta, bid.size if bid else np.nan, bid.price/dbn.FIXED_PRICE_SCALE if bid else np.nan, ask.size if ask else np.nan, ask.price/dbn.FIXED_PRICE_SCALE if ask else np.nan, bool(mbo.flags & db.RecordFlags.F_LAST)]
-                f.write(','.join(map(str,data))+'\n')
-            except Exception as e:
-                print('Exception: ', repr(e), mbo, bid, ask)
+    f.write('instrument,ts_event,ts_recv,seconds_since_start,order_id,action,side,size,price,bq,bp,aq,ap')
+    for result in generator:
+        mbo, market, instrument, seconds = result
+        try:
+            bid,ask = market.aggregated_bbo(mbo.instrument_id)
+            data = [instrument, mbo.ts_event, mbo.ts_recv, seconds, mbo.order_id, mbo.action, mbo.side, mbo.size, mbo.price, bid.size if bid else np.nan, bid.price/dbn.FIXED_PRICE_SCALE if bid else np.nan, ask.size if ask else np.nan, ask.price/dbn.FIXED_PRICE_SCALE if ask else np.nan]
+            f.write(','.join(map(str,data))+'\n')
+        except Exception as e:
+            print('Exception: ', repr(e), mbo, bid, ask)
 
 if __name__ == "__main__":
     folders = ["../data/databento/mes/ftp.databento.com/E8XGYL35/GLBX-20241008-PP9KBLT3CX/", "../data/databento/es/ftp.databento.com/E8XGYL35/GLBX-20241008-8PTR93CRA9/"]
-    filenames = set([file.split('/')[-1] for folder in folders for file in glob.glob(f'{folder}/*.zst')])
+    filenames = sorted(set([file.split('/')[-1] for folder in folders for file in glob.glob(f'{folder}/*.zst')]))
     print(filenames)
     for filename in tqdm.tqdm(filenames):
+        print('Start',filename)
         mbos = interleave([parse_file(folder+filename) for folder in folders])
-        write_csv(mbos, '../output/databento/'+filename.split('.')[0]+'.csv')
+        output_file = '../output/databento/'+filename.split('.')[0]+'.csv'
+        datastores = {db.DBNStore.from_file(folder+filename) for folder in folders}
+        bounds = {(data.metadata.start,data.metadata.end) for data in datastores}
+        assert len(bounds) == 1, (filename,bounds)
+        bounds = list(bounds)[0]
+        with open(output_file,'w') as f:
+            f.write(f'{bounds[0]},{bounds[1]}\n')
+            write_csv(tqdm.tqdm(mbos), f)
+        print('Done',filename)

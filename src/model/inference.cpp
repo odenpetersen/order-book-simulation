@@ -1,40 +1,45 @@
 #include <iostream>
 #include <iomanip>
 #include <cmath>
+#include <string>
 
-#include "Parse.h"
-#include "Kernel.h"
+#include <Eigen/Dense>
 
 // Example usage
+#include "Parse.h"
+#include "Kernel.h"
 int main() {
 	std::cout << std::setprecision(20);
-	long double seconds_since_midnight;
 
-	Kernel* kernel = new Kernel(1.0, 1.0, 2.0);
-	do {
+	PoissonKernel kernel(Eigen::VectorXd::Constant(11, 1.0));
+	while (true) {
+		Realisation session("../../output/databento/glbx-mdp3-20240913.csv"); // Replace with your CSV file path
 
-		Realisation session("../../output/databento/glbx-mdp3-20240806.csv"); // Replace with your CSV file path
-
-		int bucket_size = 100000;
-		int curr_bucket = 0;
-		for (const auto& event : session) {
-			if (event->action[0] == 'T') {
-				seconds_since_midnight = event->time - (((int) event->time)/(60*60*24))*60*60*24;
-				kernel->update(seconds_since_midnight);
-				//std::cout << kernel->num_events << std::endl;
-				if (kernel->num_events >= curr_bucket + bucket_size) {
-					curr_bucket = kernel->num_events;
-					std::cout << kernel->num_events << ", " << kernel->estimated_num_endo + kernel->estimated_num_exo << ", " << kernel->estimated_num_endo << ", " << kernel->estimated_num_exo << ", " << std::endl;
-					std::cout << kernel->endo_intensity << ", " << kernel->decaying_sum_ti << ", " << kernel->beta_denominator << std::endl;
-				}
+		int bucket_size = 1000;
+		int bucket_counter = 0;
+		for (const auto event : session) {
+			kernel.set_start_time((int)((event->time/60/60)+0.5)*60*60);
+			kernel.set_current_time(event->time);
+			kernel.update(*event);
+			bucket_counter++;
+			if (bucket_counter >= bucket_size) {
+				std::cout << (event->time / seconds_in_day)*100 << "\% done" << std::endl;
+				std::cout << *event << std::endl;
+				bucket_counter = 0;
 			}
 		}
-		kernel->end_time = seconds_since_midnight;
+		kernel.set_end_time((int)((kernel.current_time/60/60)+0.5)*60*60);
 
-		std::cerr << kernel->nu << ", " << kernel->alpha << ", " << kernel->beta << std::endl;
-		
-	} while (kernel->em_step());
+		auto [hess,grad] = kernel.get_hessian_and_gradient();
+		std::cout << kernel.start_time << ", " << kernel.end_time << std::endl;
+		std::cout << hess << std::endl;
+		std::cout << grad << std::endl;
+		std::cout << kernel.get_params() << std::endl;
+		auto step = -hess.colPivHouseholderQr().solve(grad);
+		std::cout << step << std::endl;
+		kernel.set_params(kernel.get_params() + step);
+		std::cout << kernel.get_params() << std::endl;
+	}
 
 	return 0;
 }
-
